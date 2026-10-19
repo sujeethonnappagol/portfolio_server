@@ -1,10 +1,12 @@
 import { randomBytes } from 'node:crypto';
-import { Router } from 'express';
+import express, { Router } from 'express';
 import rateLimit from 'express-rate-limit';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import mongoose from 'mongoose';
 import Contact from '../models/Contact.js';
+import PortfolioContent from '../models/PortfolioContent.js';
+import { portfolioDefaults, portfolioFields } from '../data/portfolioDefaults.js';
 import {
   csrfCookieName,
   csrfCookieOptions,
@@ -32,7 +34,7 @@ const trustedOrigins = new Set([
 ].map((origin) => origin.trim()).filter(Boolean));
 
 router.use((request, response, next) => {
-  if (['POST', 'PATCH', 'DELETE'].includes(request.method)) {
+  if (['POST', 'PUT', 'PATCH', 'DELETE'].includes(request.method)) {
     const origin = request.get('Origin');
     if (origin && !trustedOrigins.has(origin)) {
       return response.status(403).json({ error: 'Request origin is not allowed.' });
@@ -40,6 +42,110 @@ router.use((request, response, next) => {
   }
   return next();
 });
+
+router.get('/portfolio', requireAdmin, async (_request, response, next) => {
+  try {
+    const saved = await PortfolioContent.findById('site').select('content resume portrait updatedAt').lean();
+    return response.json({
+      content: { ...portfolioDefaults, ...(saved?.content || {}) },
+      resume: saved?.resume ? { filename: saved.resume.filename, updatedAt: saved.resume.updatedAt } : null,
+      portrait: saved?.portrait ? { filename: saved.portrait.filename, updatedAt: saved.portrait.updatedAt } : null,
+    });
+  } catch (error) {
+    return next(error);
+  }
+});
+
+router.put('/portfolio', requireAdmin, requireCsrf, async (request, response, next) => {
+  const content = request.body;
+  if (!content || typeof content !== 'object' || Array.isArray(content)
+    || portfolioFields.some((field) => typeof content[field] !== 'string')
+    || Object.keys(content).some((field) => !portfolioFields.includes(field))) {
+    return response.status(400).json({ error: 'Portfolio content is incomplete or contains an unknown field.' });
+  }
+  const limits = {
+    name: 80, role: 100, location: 100, availability: 100,
+    headlinePrimary: 100, headlineAccent: 100, heroIntro: 500,
+    aboutLead: 700, aboutExperience: 900, aboutOutside: 900,
+    email: 254, phone: 40, linkedin: 300, github: 300, leetcode: 300,
+  };
+  for (const [field, maxLength] of Object.entries(limits)) {
+    const value = content[field].trim();
+    if (value.length > maxLength) return response.status(400).json({ error: `${field} is too long.` });
+    content[field] = value;
+  }
+  if (!content.name || !content.role || !content.location || !content.headlinePrimary || !content.headlineAccent
+    || !content.heroIntro || !content.aboutLead || !content.email
+    || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(content.email)) {
+    return response.status(400).json({ error: 'Name, role, location, headlines, intro, about text, and a valid email are required.' });
+  }
+  for (const field of ['linkedin', 'github', 'leetcode']) {
+    if (!content[field]) continue;
+    try {
+      if (!['https:', 'http:'].includes(new URL(content[field]).protocol)) throw new Error('Invalid URL');
+    } catch {
+      return response.status(400).json({ error: `Enter a valid URL for ${field}.` });
+    }
+  }
+
+  try {
+    await PortfolioContent.findByIdAndUpdate(
+      'site',
+      { $set: { content } },
+      { upsert: true, new: true, setDefaultsOnInsert: true },
+    );
+    return response.json({ content, message: 'Portfolio details saved.' });
+  } catch (error) {
+    return next(error);
+  }
+});
+
+function safeAssetFilename(value, fallback) {
+  let filename = fallback;
+  try {
+    if (value) filename = decodeURIComponent(value);
+  } catch {
+    filename = fallback;
+  }
+  return filename.replace(/[^a-zA-Z0-9._ -]/g, '_').slice(0, 120) || fallback;
+}
+
+router.put('/portfolio/resume', requireAdmin, requireCsrf,
+  express.raw({ type: 'application/pdf', limit: '4mb' }), async (request, response, next) => {
+    const data = request.body;
+    if (!Buffer.isBuffer(data) || data.length < 5 || data.subarray(0, 5).toString() !== '%PDF-') {
+      return response.status(400).json({ error: 'Choose a valid PDF file.' });
+    }
+    try {
+      const filename = safeAssetFilename(request.get('X-File-Name'), 'resume.pdf');
+      const asset = { filename: filename.toLowerCase().endsWith('.pdf') ? filename : `${filename}.pdf`, contentType: 'application/pdf', data, updatedAt: new Date() };
+      await PortfolioContent.findByIdAndUpdate('site', { $set: { resume: asset } }, { upsert: true, new: true, setDefaultsOnInsert: true });
+      return response.json({ resume: { filename: asset.filename, updatedAt: asset.updatedAt }, message: 'Resume updated.' });
+    } catch (error) {
+      return next(error);
+    }
+  });
+
+router.put('/portfolio/portrait', requireAdmin, requireCsrf,
+  express.raw({ type: ['image/jpeg', 'image/png', 'image/webp'], limit: '2.5mb' }), async (request, response, next) => {
+    const data = request.body;
+    const contentType = request.get('Content-Type')?.split(';')[0];
+    const validImage = Buffer.isBuffer(data) && (
+      (contentType === 'image/jpeg' && data[0] === 0xff && data[1] === 0xd8 && data[2] === 0xff)
+      || (contentType === 'image/png' && data.subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10])))
+      || (contentType === 'image/webp' && data.subarray(0, 4).toString() === 'RIFF' && data.subarray(8, 12).toString() === 'WEBP')
+    );
+    if (!validImage) return response.status(400).json({ error: 'Choose a valid JPG, PNG, or WebP image.' });
+    try {
+      const extension = { 'image/jpeg': 'jpg', 'image/png': 'png', 'image/webp': 'webp' }[contentType];
+      const filename = safeAssetFilename(request.get('X-File-Name'), `portrait.${extension}`);
+      const asset = { filename, contentType, data, updatedAt: new Date() };
+      await PortfolioContent.findByIdAndUpdate('site', { $set: { portrait: asset } }, { upsert: true, new: true, setDefaultsOnInsert: true });
+      return response.json({ portrait: { filename: asset.filename, updatedAt: asset.updatedAt }, message: 'Portrait updated.' });
+    } catch (error) {
+      return next(error);
+    }
+  });
 
 router.get('/csrf', (_request, response) => {
   const csrfToken = randomBytes(32).toString('hex');

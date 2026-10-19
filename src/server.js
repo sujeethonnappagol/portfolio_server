@@ -8,6 +8,7 @@ import { resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import Contact from './models/Contact.js';
 import adminRouter from './routes/admin.js';
+import portfolioRouter from './routes/portfolio.js';
 
 const app = express();
 const port = Number(process.env.PORT) || 5000;
@@ -47,6 +48,8 @@ const projects = [
 app.get('/api/health', (_request, response) => {
   response.json({ status: 'ok', database: getDatabaseStatus() });
 });
+
+app.use('/api/portfolio', portfolioRouter);
 
 app.get('/api/projects', (_request, response) => {
   response.json(projects);
